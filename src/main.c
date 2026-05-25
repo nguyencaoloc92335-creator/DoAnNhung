@@ -11,6 +11,11 @@ void SysTick_Handler(void) {
     msTicks++;
 }
 
+void delay_ms(uint32_t ms) {
+    uint32_t start = msTicks;
+    while ((msTicks - start) < ms);
+}
+
 void SystemClock_Config(void) {
     RCC->CR |= RCC_CR_HSEON;
     while ((RCC->CR & RCC_CR_HSERDY) == 0);
@@ -41,9 +46,28 @@ void LED_PC13_Init(void) {
 I2C_Handle_t hi2c1;
 I2C_LCD_HandleTypeDef lcd1;
 
+void Force_USB_ReEnumerate(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN; // Bật clock Port A
+    
+    // Cấu hình PA12 (USB DP) là Output Push-Pull
+    GPIOA->CRH &= ~(GPIO_CRH_MODE12 | GPIO_CRH_CNF12);
+    GPIOA->CRH |= GPIO_CRH_MODE12_1; // Output 2MHz
+    
+    GPIOA->ODR &= ~(1 << 12); // Kéo PA12 xuống LOW để ngắt kết nối ảo với PC
+    
+    delay_ms(15); // Chờ 15ms để PC kịp nhận diện thiết bị đã "rút ra"
+    
+    // Khôi phục PA12 về trạng thái Floating Input (Để module USB ngoại vi tiếp quản lại)
+    GPIOA->CRH &= ~(GPIO_CRH_MODE12 | GPIO_CRH_CNF12);
+    GPIOA->CRH |= GPIO_CRH_CNF12_0; 
+    
+    delay_ms(15);
+}
+
 int main(void) {
     SystemClock_Config();
     LED_PC13_Init();
+    Force_USB_ReEnumerate();
 
     // Khởi tạo thông số phần cứng cho I2C1
     hi2c1.Instance = I2C1;
@@ -52,10 +76,11 @@ int main(void) {
 
     // Trỏ LCD sang interface I2C1 và khởi tạo LCD
     lcd1.hi2c = &hi2c1;
-    lcd1.address = 0x3F; // Hãy sửa lại thành 0x3F nếu LCD PCF8574T của bạn mang phiên bản cũ 
+    lcd1.address = 0x27; // Hãy sửa lại thành 0x3F nếu LCD PCF8574T của bạn mang phiên bản cũ 
     lcd1.col = 16;
     lcd1.row = 2;
     lcd_init(&lcd1);
+    delay_ms(1000);
 
     // In thông báo khi mới cấp nguồn hệ thống
     lcd_setcursor(&lcd1, 0, 0);
@@ -72,43 +97,52 @@ int main(void) {
     while (1) {
         // Tác vụ nền của USB (luôn phải chạy liên tục)
         tud_task();
+        lcd_task(&lcd1);
 
         // -----------------------------------------------------------
-        // KHỐI 1: NHỊP TIM (Chỉ lo nháy LED, độc lập hoàn toàn)
+        // KHỐI 1: NHỊP TIM
         // -----------------------------------------------------------
         heartbeat_counter++;
         if (heartbeat_counter >= 3000000) { 
-            GPIOC->ODR ^= (1 << 13); // Đảo trạng thái LED
+            GPIOC->ODR ^= (1 << 13);
             heartbeat_counter = 0;
         }
 
         // -----------------------------------------------------------
-        // KHỐI 2: USB PARSER (Nằm NGOÀI khối nhịp tim, chạy liên tục)
+        // KHỐI 2: XỬ LÝ NHẬN/GỬI USB CDC CHUẨN TINYUSB
         // -----------------------------------------------------------
-        if (strlen(buf) > 0) {
-            // Xóa nhanh 16 ký tự ở dòng số 2 để không bị kẹt rác từ lệnh dài trước đó
-            lcd_setcursor(&lcd1, 0, 1);
-            lcd_print_string(&lcd1, "                ");
-                
-            // In ngay nội dung lấy từ USB xuống màn LCD
-            lcd_setcursor(&lcd1, 0, 1);
-            lcd_print_string(&lcd1, buf);
+        // Chỉ thực thi khi thực sự có dữ liệu mới từ máy tính gửi xuống
+        if (tud_cdc_available()) {
+            char buf[64] = {0}; // Tạo buffer cục bộ và reset về 0
+            
+            // Đọc dữ liệu từ bộ đệm USB ra buf
+            uint32_t count = tud_cdc_read(buf, sizeof(buf) - 1);
+            
+            if (count > 0) {
+                // Xóa nhanh 16 ký tự ở dòng số 2
+                lcd_setcursor(&lcd1, 0, 1);
+                lcd_print_string(&lcd1, "                ");
+                    
+                // In ngay nội dung lấy từ USB xuống màn LCD
+                lcd_setcursor(&lcd1, 0, 1);
+                lcd_print_string(&lcd1, buf);
 
-            // Giữ lại các lệnh test logic
-            if (strcmp(buf, "1") == 0) {
-                tud_cdc_write_str("ON\r\n");  
-            } 
-            else if (strcmp(buf, "0") == 0) {
-                tud_cdc_write_str("OFF\r\n"); 
-            } 
-            else {
-                // Dội lại thông báo xác nhận thành công về Terminal của PC
-                tud_cdc_write_str("Hien thi: ");
-                tud_cdc_write_str(buf);
-                tud_cdc_write_str("\r\n");
+                // Loại bỏ ký tự \r hoặc \n nếu phần mềm Terminal / Python vô tình gửi kèm
+                // Để lệnh strcmp hoạt động chuẩn xác
+                if (strncmp(buf, "1", 1) == 0) {
+                    tud_cdc_write_str("ON\r\n");  
+                } 
+                else if (strncmp(buf, "0", 1) == 0) {
+                    tud_cdc_write_str("OFF\r\n"); 
+                } 
+                else {
+                    tud_cdc_write_str("Hien thi: ");
+                    tud_cdc_write_str(buf);
+                    tud_cdc_write_str("\r\n");
+                }
+                    
+                tud_cdc_write_flush(); // Đẩy dữ liệu lên PC
             }
-                
-            tud_cdc_write_flush();
         }
     }
 }
