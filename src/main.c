@@ -113,19 +113,24 @@ int main(void) {
         // -----------------------------------------------------------
         // Chỉ thực thi khi thực sự có dữ liệu mới từ máy tính gửi xuống
         if (tud_cdc_available()) {
-            char buf[64] = {0}; // Tạo buffer cục bộ và reset về 0
-            
-            // Đọc dữ liệu từ bộ đệm USB ra buf
+            char buf[64] = {0}; 
             uint32_t count = tud_cdc_read(buf, sizeof(buf) - 1);
             
             if (count > 0) {
-                // Xóa nhanh 16 ký tự ở dòng số 2
+                // Đợi LCD rảnh (nếu trước đó nó đang in dở)
+                while (lcd1.state != LCD_SM_IDLE) {
+                    lcd_task(&lcd1); // Bơm task để nó mau hoàn thành
+                }
+
+                // Đặt con trỏ về đầu dòng 2 (Lệnh này gửi nhanh nên dùng blocking cũ cũng được)
                 lcd_setcursor(&lcd1, 0, 1);
-                lcd_print_string(&lcd1, "                ");
-                    
-                // In ngay nội dung lấy từ USB xuống màn LCD
-                lcd_setcursor(&lcd1, 0, 1);
-                lcd_print_string(&lcd1, buf);
+                
+                // Format chuỗi hiển thị thành 16 ký tự (căn trái), tự động điền khoảng trắng ở đuôi
+                char display_buf[17];
+                snprintf(display_buf, sizeof(display_buf), "%-16s", buf);
+                
+                // Gửi xuống State Machine xử lý Non-blocking
+                lcd_print_string(&lcd1, display_buf);
 
                 // Loại bỏ ký tự \r hoặc \n nếu phần mềm Terminal / Python vô tình gửi kèm
                 // Để lệnh strcmp hoạt động chuẩn xác
