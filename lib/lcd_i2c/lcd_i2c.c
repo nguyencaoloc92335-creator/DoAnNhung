@@ -94,3 +94,61 @@ LCD_Status_t lcd_print_string(I2C_LCD_HandleTypeDef *lcd, const char *str) // D�
     }
     return LCD_ok; // Trả về trạng thái thành công sau khi in xong chuỗi
 }
+
+void lcd_task(I2C_LCD_HandleTypeDef *lcd) {
+    // Nếu I2C phần cứng đang bận truyền luồng khác, thoát ngay (Non-blocking)
+    if (lcd->hi2c->busy || (lcd->hi2c->Instance->SR2 & I2C_SR2_BUSY)) {
+        return; 
+    }
+
+    switch (lcd->state) {
+        case LCD_SM_IDLE:
+            // Có dữ liệu mới trong buffer cần in
+            if (lcd->buf_index < lcd->buf_length) {
+                lcd->state = LCD_SM_SENDING_HIGH;
+            }
+            break;
+
+        case LCD_SM_SENDING_HIGH:
+            {
+                uint8_t data = lcd->buffer[lcd->buf_index];
+                uint8_t nibble_high = data & 0xF0;
+                
+                // Chuẩn bị mảng 2 byte để chốt sườn xuống
+                lcd->temp_i2c_data[0] = nibble_high | (lcd->current_rs << LCD_RS) | (1 << LCD_EN) | (1 << LCD_BL);
+                lcd->temp_i2c_data[1] = nibble_high | (lcd->current_rs << LCD_RS) | (0 << LCD_EN) | (1 << LCD_BL);
+                
+                I2C_Master_Transmit_IT(lcd->hi2c, lcd->address, lcd->temp_i2c_data, 2);
+                lcd->state = LCD_SM_WAIT_HIGH;
+            }
+            break;
+
+        case LCD_SM_WAIT_HIGH:
+            // Do đầu hàm đã check I2C rảnh, nếu lọt vào case này tức là đã gửi xong Nibble cao
+            lcd->state = LCD_SM_SENDING_LOW;
+            break;
+
+        case LCD_SM_SENDING_LOW:
+            {
+                uint8_t data = lcd->buffer[lcd->buf_index];
+                uint8_t nibble_low = (data << 4) & 0xF0;
+                
+                lcd->temp_i2c_data[0] = nibble_low | (lcd->current_rs << LCD_RS) | (1 << LCD_EN) | (1 << LCD_BL);
+                lcd->temp_i2c_data[1] = nibble_low | (lcd->current_rs << LCD_RS) | (0 << LCD_EN) | (1 << LCD_BL);
+                
+                I2C_Master_Transmit_IT(lcd->hi2c, lcd->address, lcd->temp_i2c_data, 2);
+                lcd->state = LCD_SM_WAIT_LOW;
+            }
+            break;
+
+        case LCD_SM_WAIT_LOW:
+            // Gửi xong Nibble thấp -> Hoàn thành 1 ký tự
+            lcd->buf_index++;
+            if (lcd->buf_index >= lcd->buf_length) {
+                lcd->state = LCD_SM_IDLE; // Xong toàn bộ chuỗi
+            } else {
+                lcd->state = LCD_SM_SENDING_HIGH; // Tiếp tục ký tự tiếp theo
+            }
+            break;
+    }
+}
