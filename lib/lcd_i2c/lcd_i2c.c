@@ -1,12 +1,28 @@
 #include "lcd_i2c.h"
 
+extern void delay_ms(uint32_t ms);
+
 static LCD_Status_t LCD_Write_nibble(I2C_LCD_HandleTypeDef *lcd, uint8_t nibble_data, uint8_t rs_state)
 {
-    // giải thích tại sao không cần delay ở đây do i2c có tốc độ 100kHz còn khoảng cách giữa 2 lần gửi tối thiểu là 450 ns theo datasheet (cần đi sâu khi làm slide)
-    uint8_t i2c_frame_high = nibble_data| (rs_state << LCD_RS) | (1 << LCD_EN) | (1 << LCD_BL); // Kết hợp dữ liệu nibble với tín hiệu EN và BL;
-    I2C_WriteByte(lcd->I2C, lcd->address, i2c_frame_high); // Gửi dữ liệu qua I2C
-    uint8_t i2c_frame_low = nibble_data| (rs_state << LCD_RS) | (1 << LCD_BL); // Kết hợp dữ liệu nibble với tín hiệu EN và BL;
-    I2C_WriteByte(lcd->I2C, lcd->address, i2c_frame_low); // Gửi dữ liệu qua I2C
+    uint8_t data[2];
+    
+    // Byte 0: EN = 1 (Tạo sườn lên / trạng thái High để IC dịch dữ liệu)
+    data[0] = nibble_data | (rs_state << LCD_RS) | (1 << LCD_EN) | (1 << LCD_BL); 
+    
+    // Byte 1: EN = 0 (Tạo sườn xuống / trạng thái Low để chốt dữ liệu)
+    data[1] = nibble_data | (rs_state << LCD_RS) | (0 << LCD_EN) | (1 << LCD_BL); 
+    
+    // Gửi liên tục 2 byte qua I2C ngắt
+    if (I2C_Master_Transmit_IT(lcd->hi2c, lcd->address, data, 2) != I2C_OK) {
+        return LCD_error;
+    }
+    
+    // Phải chờ ngắt I2C báo rảnh trước khi thoát hàm, vì mảng 'data' là biến cục bộ.
+    // Nếu thoát hàm ngay, mảng data sẽ bị ghi đè gây sai lỗi logic trên đường truyền.
+    if (I2C_WaitUntilReady(lcd->hi2c) != I2C_OK) {
+        return LCD_error;
+    }
+
     return LCD_ok;
 }
 

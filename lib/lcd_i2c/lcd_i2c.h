@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <stm32f1xx.h>
 #include "i2c.h"
-//#include "delay.h"
 
 #define LCD_RS 0
 #define LCD_RW 1
@@ -21,7 +20,7 @@ typedef enum {
 
 // Cấu trúc để quản lý LCD qua I2C, Lưu ý sắp xếp các biến theo thứ tự giảm dần về kích thước để tối ưu bộ nhớ
 typedef struct {
-    I2C_TypeDef *I2C; // Con trỏ đến I2C được sử dụng
+    I2C_Handle_t *I2C; // Con trỏ đến I2C được sử dụng
     uint8_t address;   // Địa chỉ I2C của LCD
     uint8_t col;     // Số cột của LCD
     uint8_t row;     // Số hàng của LCD
