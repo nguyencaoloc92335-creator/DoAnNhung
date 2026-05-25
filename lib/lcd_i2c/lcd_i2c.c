@@ -84,15 +84,26 @@ LCD_Status_t lcd_print_char(I2C_LCD_HandleTypeDef *lcd, char c)
     return LCD_Write_data(lcd, (uint8_t)c); // Gửi ký tự đến LCD
 }
 
-LCD_Status_t lcd_print_string(I2C_LCD_HandleTypeDef *lcd, const char *str) // Dùng const char* để đưa chuỗi vào bộ nhớ flash thay vì RAM, giúp tiết kiệm bộ nhớ RAM cho các biến khác trong hệ thống, đồng thời đảm bảo tính an toàn của dữ liệu chuỗi khi không bị thay đổi trong quá trình thực thi chương trình.
+LCD_Status_t lcd_print_string(I2C_LCD_HandleTypeDef *lcd, const char *str) 
 {
-    while (*str) {
-        LCD_Status_t status = lcd_print_char(lcd, *str++); // Gửi từng ký tự trong chuỗi đến LCD
-        if (status != LCD_ok) {
-            return status; // Nếu có lỗi, trả về trạng thái lỗi
-        }
+    // 1. Kiểm tra xem LCD có đang bận in chuỗi khác không (Chống ghi đè buffer)
+    if (lcd->state != LCD_SM_IDLE) {
+        return LCD_busy; 
     }
-    return LCD_ok; // Trả về trạng thái thành công sau khi in xong chuỗi
+
+    // 2. Nạp dữ liệu vào buffer cục bộ của LCD
+    strncpy(lcd->buffer, str, sizeof(lcd->buffer) - 1);
+    lcd->buffer[sizeof(lcd->buffer) - 1] = '\0'; // Đảm bảo luôn có ký tự kết thúc chuỗi
+    
+    // 3. Khởi tạo các thông số cho State Machine
+    lcd->buf_length = strlen(lcd->buffer);
+    lcd->buf_index = 0;
+    lcd->current_rs = 1; // RS = 1 để I2C biết đây là Dữ liệu (Data), không phải Lệnh (Command)
+    
+    // 4. Kích hoạt State Machine
+    lcd->state = LCD_SM_SENDING_HIGH; 
+    
+    return LCD_ok;
 }
 
 void lcd_task(I2C_LCD_HandleTypeDef *lcd) {
