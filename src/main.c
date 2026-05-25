@@ -52,7 +52,7 @@ int main(void) {
 
     // Trỏ LCD sang interface I2C1 và khởi tạo LCD
     lcd1.hi2c = &hi2c1;
-    lcd1.address = 0x27; // Hãy sửa lại thành 0x3F nếu LCD PCF8574T của bạn mang phiên bản cũ 
+    lcd1.address = 0x3F; // Hãy sửa lại thành 0x3F nếu LCD PCF8574T của bạn mang phiên bản cũ 
     lcd1.col = 16;
     lcd1.row = 2;
     lcd_init(&lcd1);
