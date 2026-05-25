@@ -172,11 +172,22 @@ void I2C2_EV_IRQHandler(void) {
     }
 }
 
-// Chờ đến khi I2C rảnh (blocking nhưng ngắn)
 I2C_Status_t I2C_WaitUntilReady(I2C_Handle_t *hi2c) {
     uint32_t timeout = 100000;
+    
+    // 1. Chờ biến phần mềm (ngắt sự kiện đẩy xong dữ liệu)
     while (hi2c->busy) {
+        if (--timeout == 0) {
+            hi2c->busy = 0; // Tránh treo module nếu quá thời gian
+            return I2C_TIMEOUT;
+        }
+    }
+    
+    // 2. Chờ phần cứng I2C THỰC SỰ nhả Bus (Quét cờ BUSY của thanh ghi SR2)
+    timeout = 100000;
+    while ((hi2c->Instance->SR2 & I2C_SR2_BUSY) != 0) {
         if (--timeout == 0) return I2C_TIMEOUT;
     }
+    
     return hi2c->error;
 }

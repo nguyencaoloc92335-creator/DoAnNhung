@@ -41,5 +41,5 @@ I2C_Status_t I2C_Init(I2C_Handle_t *hi2c);
 // Hàm này sẽ khởi động quá trình truyền dữ liệu qua I2C bằng ngắt dùng non-blocking, trả về ngay sau khi khởi động quá trình mà không chờ đợi hoàn thành. 
 // Dữ liệu sẽ được gửi từng byte một trong ISR cho đến khi hoàn thành, và trạng thái của quá trình sẽ được cập nhật trong hi2c->state để main có thể kiểm tra. 
 I2C_Status_t I2C_Master_Transmit_IT(I2C_Handle_t *hi2c, uint16_t address, uint8_t *data, uint8_t length); 
-
+I2C_Status_t I2C_WaitUntilReady(I2C_Handle_t *hi2c);
 #endif
