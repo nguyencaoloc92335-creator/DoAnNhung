@@ -35,6 +35,24 @@ volatile uint32_t count_type0 = 0;
 volatile uint32_t count_type1 = 0;
 volatile uint32_t count_type2 = 0;
 
+// --- BIẾN TOÀN CỤC CHO UI & NGƯỠNG ĐỘC LẬP ---
+volatile uint8_t current_page = 0;      // 0: Loại 0, 1: Loại 1, 2: Loại 2 (Đứng yên, chỉ chuyển khi bấm TAB)
+volatile uint8_t in_setting_mode = 0;   // 0: Chế độ xem thống kê, 1: Chế độ cài đặt ngưỡng
+volatile uint32_t limit_type0 = 5;     // Ngưỡng dừng riêng cho Loại 0
+volatile uint32_t limit_type1 = 5;     // Ngưỡng dừng riêng cho Loại 1
+volatile uint32_t limit_type2 = 5;     // Ngưỡng dừng riêng cho Loại 2
+volatile uint8_t system_halted = 0;    // 0: Băng tải đang chạy, 1: Đã dừng do đủ hàng
+
+// Hàm kiểm tra ngưỡng riêng biệt - Chỉ cần 1 loại đạt ngưỡng là dừng toàn hệ thống
+void Check_Limit(void) {
+    if (system_halted == 0) {
+        if (count_type0 >= limit_type0 || count_type1 >= limit_type1 || count_type2 >= limit_type2) {
+            GPIOB->BRR = (1 << 12); // Tắt chân PB12 để dừng băng tải ngay lập tức
+            system_halted = 1;
+        }
+    }
+}
+
 uint32_t my_strlen(const char *str) {
     uint32_t len = 0;
     while (str[len] != '\0') len++;
@@ -110,13 +128,13 @@ void Hardware_Init(void) {
     for(volatile int i = 0; i < 720000; i++); // Trễ cứng ~10ms để PC ngắt kết nối cũ
     // TinyUSB sau đó sẽ tự động lấy lại cấu hình PA12 thành Alternate Function.
 
-    // --- CẤU HÌNH CẢM BIẾN (PA0, PA1, PA2) ---
-    // Clear cấu hình cũ (bits 0-11)
-    GPIOA->CRL &= ~(0x00000FFF);
-    // Set Input Pull-up/Pull-down (mode = 00, cnf = 10 -> 0x8)
-    GPIOA->CRL |= 0x00000888;
-    // Bật Pull-up cho PA0, PA1, PA2 (kéo lên 3.3V)
-    GPIOA->ODR |= (1 << 0) | (1 << 1) | (1 << 2);
+    // --- CẤU HÌNH CẢM BIẾN (PA0-PA2) & NÚT BẤM (PA3-PA6) ---
+    // Clear cấu hình cũ của chân PA0 đến PA7 (bits 0-31 của CRL)
+    GPIOA->CRL &= ~(0xFFFFFFFF);
+    // Set Input Pull-up/Pull-down (mode = 00, cnf = 10 -> 0x8 cho mỗi chân)
+    GPIOA->CRL |= 0x88888888;
+    // Bật Pull-up cho PA0, PA1, PA2, PA3, PA4, PA5, PA6 (kéo lên 3.3V)
+    GPIOA->ODR |= (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6);
 
     // --- CẤU HÌNH RELAY (PB12, PB13, PB14) ---
     // Clear cấu hình cũ của PB12, PB13, PB14 (bits 16-27 của CRH)
@@ -254,72 +272,143 @@ void USBWakeUp_IRQHandler(void) {
 }
 
 void Task_LCD_Display(void *pvParameters) {
-    // 1. Khởi tạo I2C ở tốc độ 100kHz
+    // 1. Khởi tạo I2C và cấu hình màn hình LCD 1602
     hi2c1.Instance = I2C1;
     hi2c1.ClockSpeed = 100000;
     I2C_Init(&hi2c1);
 
-    // 2. Khởi tạo cấu hình mảng hiển thị (LCD 20x4)
     hlcd.hi2c = &hi2c1;
-    hlcd.address = 0x27; // Địa chỉ I2C tùy thuộc vào module (thường là 0x27 hoặc 0x3F)
-    hlcd.col = 20;       
-    hlcd.row = 4;
+    hlcd.address = 0x27; 
+    hlcd.col = 16;       // Chỉnh thành 16 cột
+    hlcd.row = 2;        // Chỉnh thành 2 hàng
     lcd_init(&hlcd);
 
     TickType_t last_update = 0;
     uint8_t render_step = 0;
-    char buffer[21];
+    char buffer[17]; // Buffer chứa đúng 16 ký tự + null terminator
+
+    uint8_t last_tab = 1, last_set = 1, last_up = 1, last_down = 1;
+    uint8_t force_render = 1;
 
     for(;;) {
-        // Cập nhật số liệu hiển thị mỗi 500ms
+        // --- 2. ĐỌC TRẠNG THÁI NÚT BẤM ---
+        uint8_t tab  = (GPIOA->IDR & (1 << 3)) ? 1 : 0;
+        uint8_t set  = (GPIOA->IDR & (1 << 4)) ? 1 : 0;
+        uint8_t up   = (GPIOA->IDR & (1 << 5)) ? 1 : 0;
+        uint8_t down = (GPIOA->IDR & (1 << 6)) ? 1 : 0;
+        
+        uint8_t btn_pressed = 0; // Cờ báo hiệu có nút được nhấn
+
+        // Nút TAB: Chuyển trang (Loại 0 -> Loại 1 -> Loại 2)
+        if (tab == 0 && last_tab == 1) {
+            if (current_page < 2) current_page++;
+            else current_page = 0;
+            force_render = 1;
+            btn_pressed = 1;
+        }
+
+        // Nút SETTING: Đảo qua lại giữa trang Thống kê và trang Cài đặt
+        if (set == 0 && last_set == 1) {
+            in_setting_mode = !in_setting_mode;
+            force_render = 1;
+            btn_pressed = 1;
+        }
+
+        // Nút UP/DOWN: Chỉ nhận khi ở trang Cài đặt
+        if (in_setting_mode == 1) {
+            if (up == 0 && last_up == 1) {
+                if (current_page == 0) limit_type0++;
+                else if (current_page == 1) limit_type1++;
+                else if (current_page == 2) limit_type2++;
+
+                if (system_halted && count_type0 < limit_type0 && count_type1 < limit_type1 && count_type2 < limit_type2) {
+                    system_halted = 0;
+                    GPIOB->BSRR = (1 << 12); // Bật lại băng tải
+                }
+                force_render = 1;
+                btn_pressed = 1;
+            }
+            if (down == 0 && last_down == 1) {
+                if (current_page == 0 && limit_type0 > 1) limit_type0--;
+                else if (current_page == 1 && limit_type1 > 1) limit_type1--;
+                else if (current_page == 2 && limit_type2 > 1) limit_type2--;
+                force_render = 1;
+                btn_pressed = 1;
+            }
+        }
+
+        // --- THUẬT TOÁN CHỐNG RUNG (SOFTWARE DEBOUNCE) ---
+        if (btn_pressed) {
+            vTaskDelay(pdMS_TO_TICKS(250)); // Khóa, không cho bấm liên tiếp trong 250ms
+            // Sau khi hết khóa, đọc lại trạng thái thực tế để xóa nhiễu
+            last_tab = (GPIOA->IDR & (1 << 3)) ? 1 : 0;
+            last_set = (GPIOA->IDR & (1 << 4)) ? 1 : 0;
+            last_up  = (GPIOA->IDR & (1 << 5)) ? 1 : 0;
+            last_down = (GPIOA->IDR & (1 << 6)) ? 1 : 0;
+        } else {
+            last_tab = tab; last_set = set; last_up = up; last_down = down;
+        }
+
+        // Cập nhật giá trị đếm mới mỗi 500ms
         if (xTaskGetTickCount() - last_update > pdMS_TO_TICKS(500) && render_step == 0) {
-            render_step = 1;
+            force_render = 1;
             last_update = xTaskGetTickCount();
         }
 
-        // Máy trạng thái Render: Chỉ in dòng tiếp theo khi I2C và LCD đã rảnh
-        if (render_step > 0 && hlcd.state == LCD_SM_IDLE) {
-            char num_buf[11]; // Buffer tạm để chứa số
+        // --- 3. RENDER CHO MÀN HÌNH 1602 (Tối đa 16 ký tự/dòng) ---
+        if (force_render && hlcd.state == LCD_SM_IDLE) {
+            if (render_step == 0) render_step = 1;
+            char num_buf[11];
             
             switch (render_step) {
                 case 1:
+                    // VẼ HÀNG 1 (Tiêu đề trang)
                     lcd_setcursor(&hlcd, 0, 0);
-                    my_strcpy(buffer, "=== THONG KE ===");
+                    if (in_setting_mode) {
+                        my_strcpy(buffer, "CAI NGUONG L");
+                    } else {
+                        my_strcpy(buffer, "LOAI ");
+                    }
+                    
+                    char p[2] = {current_page + '0', '\0'};
+                    my_strcat(buffer, p);
+
+                    // Thêm thông báo nếu hệ thống DỪNG ở trang hiển thị
+                    if (!in_setting_mode && system_halted) {
+                        my_strcat(buffer, " [DUNG]");
+                    }
+                    
+                    while (my_strlen(buffer) < 16) my_strcat(buffer, " "); // Pad đúng 16 dấu cách
                     lcd_print_string(&hlcd, buffer);
                     render_step = 2;
                     break;
+
                 case 2:
+                    // VẼ HÀNG 2 (Dữ liệu)
                     lcd_setcursor(&hlcd, 0, 1);
-                    my_strcpy(buffer, "Loai 1 (A1): ");
-                    uint32_to_string(count_type1, num_buf);
-                    my_strcat(buffer, num_buf);
+                    if (in_setting_mode) {
+                        my_strcpy(buffer, "Limit: ");
+                        uint32_t cur_limit = (current_page == 0) ? limit_type0 : ((current_page == 1) ? limit_type1 : limit_type2);
+                        uint32_to_string(cur_limit, num_buf);
+                        my_strcat(buffer, num_buf);
+                    } else {
+                        my_strcpy(buffer, "So luong: ");
+                        uint32_t cur_count = (current_page == 0) ? count_type0 : ((current_page == 1) ? count_type1 : count_type2);
+                        uint32_to_string(cur_count, num_buf);
+                        my_strcat(buffer, num_buf);
+                    }
+                    
+                    while (my_strlen(buffer) < 16) my_strcat(buffer, " "); // Pad đúng 16 dấu cách
                     lcd_print_string(&hlcd, buffer);
-                    render_step = 3;
-                    break;
-                case 3:
-                    lcd_setcursor(&hlcd, 0, 2);
-                    my_strcpy(buffer, "Loai 2 (A2): ");
-                    uint32_to_string(count_type2, num_buf);
-                    my_strcat(buffer, num_buf);
-                    lcd_print_string(&hlcd, buffer);
-                    render_step = 4;
-                    break;
-                case 4:
-                    lcd_setcursor(&hlcd, 0, 3);
-                    my_strcpy(buffer, "Loai 0 (Bo): ");
-                    uint32_to_string(count_type0, num_buf);
-                    my_strcat(buffer, num_buf);
-                    lcd_print_string(&hlcd, buffer);
-                    render_step = 0;
+                    
+                    render_step = 0;     // Hoàn thành
+                    force_render = 0;
                     break;
             }
         }
 
-        // 3. Nuôi State Machine của lõi LCD liên tục
         lcd_task(&hlcd);
-        
-        // Nhường CPU 2ms (Tương đương chu kỳ quét màn hình 500Hz)
-        vTaskDelay(pdMS_TO_TICKS(2)); 
+        vTaskDelay(pdMS_TO_TICKS(10)); // Nhường CPU
     }
 }
 
@@ -330,7 +419,7 @@ void vTimerCallback_Debounce0(TimerHandle_t xTimer) {
         uint32_t current_time = xTaskGetTickCount(); // Dùng API thường
         
         if (current_time - last_trigger_time > pdMS_TO_TICKS(100)) {
-            uint8_t mock_label = 2; 
+            uint8_t mock_label = 1; 
             xQueueSend(xQueue_A1, &mock_label, 0); // Dùng API thường, timeout = 0
             last_trigger_time = current_time;
         }
@@ -352,6 +441,7 @@ void vTimerCallback_Debounce1(TimerHandle_t xTimer) {
                 if (incoming_label == 1) {
                     GPIOB->BSRR = (1 << 13); 
                     count_type1++;
+                    Check_Limit();
                     xTimerStart(xTimer_P1, 0); // Khởi động Timer Piston bằng API thường
                     xQueueSend(xQueue_Log, &incoming_label, 0); 
                 } else {
@@ -377,10 +467,12 @@ void vTimerCallback_Debounce2(TimerHandle_t xTimer) {
                 if (incoming_label == 2) {
                     GPIOB->BSRR = (1 << 14); 
                     count_type2++;
+                    Check_Limit();
                     xTimerStart(xTimer_P2, 0); 
                     xQueueSend(xQueue_Log, &incoming_label, 0); 
                 } else if (incoming_label == 0) {
                     count_type0++;
+                    Check_Limit();
                 }
             }
             last_trigger_time = current_time;
