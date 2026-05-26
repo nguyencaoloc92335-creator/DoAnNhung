@@ -4,12 +4,18 @@
 #include "queue.h"
 #include "timers.h"
 #include "tusb.h"
+#include "i2c.h"
+#include "lcd_i2c.h"
 #include <stdio.h> // Để dùng sprintf
 #include <string.h>
 
 // Hàng đợi lưu nhãn vật thể (Giả sử băng tải chứa tối đa 10 vật cùng lúc)
 #define QUEUE_LENGTH 10
 #define ITEM_SIZE    sizeof(uint8_t)
+
+// --- BIẾN TOÀN CỤC CHO I2C & LCD ---
+I2C_Handle_t hi2c1;
+I2C_LCD_HandleTypeDef hlcd;
 
 QueueHandle_t xQueue_A1; // Nhớ nhãn các vật đang trôi từ A0 -> A1
 QueueHandle_t xQueue_A2; // Nhớ nhãn các vật đang trôi từ A1 -> A2
@@ -25,6 +31,16 @@ QueueHandle_t xQueue_Log;
 volatile uint32_t count_type0 = 0;
 volatile uint32_t count_type1 = 0;
 volatile uint32_t count_type2 = 0;
+
+void delay_ms(uint32_t ms) {
+    // Nếu RTOS đã chạy, dùng hàm non-blocking của hệ điều hành
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        vTaskDelay(pdMS_TO_TICKS(ms));
+    } else {
+        // Nếu RTOS chưa chạy (vẫn ở Init), dùng vòng lặp cứng (Dựa trên SystemCoreClock 72MHz)
+        for (volatile uint32_t i = 0; i < ms * 7200; i++);
+    }
+}
 
 void Hardware_Init(void) {
     // 1. Bật Clock cho PORTA, PORTB và AFIO (Cực kỳ quan trọng cho ngắt)
@@ -77,11 +93,13 @@ void Hardware_Init(void) {
 
     // BẮT BUỘC: Cấu hình ưu tiên ngắt cho USB (Priority phải >= 5)
     NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 6);
+    NVIC_SetPriority(I2C1_EV_IRQn, 6);
 
     NVIC_EnableIRQ(EXTI0_IRQn);
     NVIC_EnableIRQ(EXTI1_IRQn);
     NVIC_EnableIRQ(EXTI2_IRQn);
     NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
+    
 }
 
 // Ngắt Cảm biến A0
@@ -252,6 +270,68 @@ void USBWakeUp_IRQHandler(void) {
     tud_int_handler(0);
 }
 
+void Task_LCD_Display(void *pvParameters) {
+    // 1. Khởi tạo I2C ở tốc độ 100kHz
+    hi2c1.Instance = I2C1;
+    hi2c1.ClockSpeed = 100000;
+    I2C_Init(&hi2c1);
+
+    // 2. Khởi tạo cấu hình mảng hiển thị (LCD 20x4)
+    hlcd.hi2c = &hi2c1;
+    hlcd.address = 0x27; // Địa chỉ I2C tùy thuộc vào module (thường là 0x27 hoặc 0x3F)
+    hlcd.col = 20;       
+    hlcd.row = 4;
+    lcd_init(&hlcd);
+
+    TickType_t last_update = 0;
+    uint8_t render_step = 0;
+    char buffer[21];
+
+    for(;;) {
+        // Cập nhật số liệu hiển thị mỗi 500ms
+        if (xTaskGetTickCount() - last_update > pdMS_TO_TICKS(500) && render_step == 0) {
+            render_step = 1;
+            last_update = xTaskGetTickCount();
+        }
+
+        // Máy trạng thái Render: Chỉ in dòng tiếp theo khi I2C và LCD đã rảnh
+        if (render_step > 0 && hlcd.state == LCD_SM_IDLE) {
+            switch (render_step) {
+                case 1:
+                    lcd_setcursor(&hlcd, 0, 0);
+                    sprintf(buffer, "=== THONG KE ===");
+                    lcd_print_string(&hlcd, buffer);
+                    render_step = 2;
+                    break;
+                case 2:
+                    lcd_setcursor(&hlcd, 0, 1);
+                    sprintf(buffer, "Loai 1 (A1): %lu", count_type1);
+                    lcd_print_string(&hlcd, buffer);
+                    render_step = 3;
+                    break;
+                case 3:
+                    lcd_setcursor(&hlcd, 0, 2);
+                    sprintf(buffer, "Loai 2 (A2): %lu", count_type2);
+                    lcd_print_string(&hlcd, buffer);
+                    render_step = 4;
+                    break;
+                case 4:
+                    lcd_setcursor(&hlcd, 0, 3);
+                    sprintf(buffer, "Loai 0 (Bo): %lu", count_type0);
+                    lcd_print_string(&hlcd, buffer);
+                    render_step = 0; // Hoàn thành quét 1 khung hình
+                    break;
+            }
+        }
+
+        // 3. Nuôi State Machine của lõi LCD liên tục
+        lcd_task(&hlcd);
+        
+        // Nhường CPU 2ms (Tương đương chu kỳ quét màn hình 500Hz)
+        vTaskDelay(pdMS_TO_TICKS(2)); 
+    }
+}
+
 int main(void) {
     SystemClock_Config();
     SystemCoreClockUpdate();
@@ -270,7 +350,7 @@ int main(void) {
     // 3. Tạo Tasks
     // Cấp phát 256 word (1KB RAM) là đủ cho cả USB và Log
     xTaskCreate(Task_USB_And_Logging, "USB_LOG", 256, NULL, configMAX_PRIORITIES - 1, NULL);
-    // Task_Blink nháy LED (nếu bạn vẫn giữ lại)
+    xTaskCreate(Task_LCD_Display, "LCD_DISP", 256, NULL, tskIDLE_PRIORITY + 2, NULL);
 
     // Khởi động hệ điều hành
     vTaskStartScheduler();
