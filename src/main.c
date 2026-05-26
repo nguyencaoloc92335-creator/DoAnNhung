@@ -1,4 +1,4 @@
-#include "stm32f103xb.h"  // Header thanh ghi CMSIS
+#include "stm32f103xb.h"  
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -6,8 +6,6 @@
 #include "tusb.h"
 #include "i2c.h"
 #include "lcd_i2c.h"
-#include <stdio.h> // Để dùng sprintf
-#include <string.h>
 
 // Hàng đợi lưu nhãn vật thể (Giả sử băng tải chứa tối đa 10 vật cùng lúc)
 #define QUEUE_LENGTH 10
@@ -24,6 +22,11 @@ QueueHandle_t xQueue_A2; // Nhớ nhãn các vật đang trôi từ A1 -> A2
 TimerHandle_t xTimer_P1;
 TimerHandle_t xTimer_P2;
 
+// Timer chống nhiễu cho cảm biến (Debounce Timers)
+TimerHandle_t xTimer_Debounce0;
+TimerHandle_t xTimer_Debounce1;
+TimerHandle_t xTimer_Debounce2;
+
 // Hàng đợi đẩy Log từ Ngắt (ISR) sang Task USB
 QueueHandle_t xQueue_Log;
 
@@ -31,6 +34,56 @@ QueueHandle_t xQueue_Log;
 volatile uint32_t count_type0 = 0;
 volatile uint32_t count_type1 = 0;
 volatile uint32_t count_type2 = 0;
+
+uint32_t my_strlen(const char *str) {
+    uint32_t len = 0;
+    while (str[len] != '\0') len++;
+    return len;
+}
+
+void my_strcpy(char *dest, const char *src) {
+    while (*src) {
+        *dest++ = *src++;
+    }
+    *dest = '\0';
+}
+
+void my_strcat(char *dest, const char *src) {
+    while (*dest) dest++; // Duyệt đến cuối chuỗi đích
+    while (*src) {
+        *dest++ = *src++;
+    }
+    *dest = '\0';
+}
+
+void* my_memcpy(void *dest, const void *src, uint32_t n) {
+    uint8_t *d = (uint8_t*)dest;
+    const uint8_t *s = (const uint8_t*)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
+
+void uint32_to_string(uint32_t num, char* str) {
+    if (num == 0) {
+        str[0] = '0';
+        str[1] = '\0';
+        return;
+    }
+    char temp[11]; // uint32_t tối đa là 4294967295 (10 chữ số)
+    int i = 0;
+    while (num > 0) {
+        temp[i++] = (num % 10) + '0';
+        num /= 10;
+    }
+    // Đảo ngược chuỗi (vì phép chia lấy dư tạo ra chữ số cuối cùng trước)
+    int j = 0;
+    while (i > 0) {
+        str[j++] = temp[--i];
+    }
+    str[j] = '\0';
+}
 
 void delay_ms(uint32_t ms) {
     // Nếu RTOS đã chạy, dùng hàm non-blocking của hệ điều hành
@@ -106,23 +159,11 @@ void Hardware_Init(void) {
 void EXTI0_IRQHandler(void) {
     if (EXTI->PR & EXTI_PR_PR0) {
         EXTI->PR = EXTI_PR_PR0; 
+        EXTI->IMR &= ~EXTI_IMR_MR0; // Tắt ngắt line 0 tạm thời để chặn nhiễu dội
         
-        // BỘ LỌC CỨNG (Deep Filter): Chờ ~2ms để nhiễu tia lửa điện từ Relay tản hết
-        for (volatile int i = 0; i < 72000; i++); 
-        
-        // Nếu sau 2ms mà chân PA0 vẫn bị kéo xuống 0V thì đích thị là VẬT THẬT
-        if ((GPIOA->IDR & (1 << 0)) == 0) { 
-            static uint32_t last_interrupt_time = 0;
-            uint32_t current_time = xTaskGetTickCountFromISR();
-            
-            if (current_time - last_interrupt_time > 100) {
-                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-                uint8_t mock_label = 2; 
-                xQueueSendFromISR(xQueue_A1, &mock_label, &xHigherPriorityTaskWoken);
-                last_interrupt_time = current_time;
-                portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-            }
-        }
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xTimerStartFromISR(xTimer_Debounce0, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Thoát ngắt ngay lập tức
     }
 }
 
@@ -130,32 +171,11 @@ void EXTI0_IRQHandler(void) {
 void EXTI1_IRQHandler(void) {
     if (EXTI->PR & EXTI_PR_PR1) {
         EXTI->PR = EXTI_PR_PR1; 
+        EXTI->IMR &= ~EXTI_IMR_MR1; // Tắt ngắt line 1 tạm thời
         
-        // BỘ LỌC CỨNG (Deep Filter): Chờ ~2ms
-        for (volatile int i = 0; i < 72000; i++); 
-        
-        if ((GPIOA->IDR & (1 << 1)) == 0) { // Đảm bảo vật thật vẫn đang che cảm biến
-            static uint32_t last_interrupt_time = 0;
-            uint32_t current_time = xTaskGetTickCountFromISR();
-            
-            if (current_time - last_interrupt_time > 100) {
-                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-                uint8_t incoming_label = 0;
-                
-                if (xQueueReceiveFromISR(xQueue_A1, &incoming_label, &xHigherPriorityTaskWoken) == pdPASS) {
-                    if (incoming_label == 1) {
-                        GPIOB->BSRR = (1 << 13); 
-                        count_type1++;
-                        xTimerStartFromISR(xTimer_P1, &xHigherPriorityTaskWoken);
-                        xQueueSendFromISR(xQueue_Log, &incoming_label, &xHigherPriorityTaskWoken);
-                    } else {
-                        xQueueSendFromISR(xQueue_A2, &incoming_label, &xHigherPriorityTaskWoken);
-                    }
-                }
-                last_interrupt_time = current_time;
-                portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-            }
-        }
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xTimerStartFromISR(xTimer_Debounce1, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
 }
 
@@ -163,32 +183,11 @@ void EXTI1_IRQHandler(void) {
 void EXTI2_IRQHandler(void) {
     if (EXTI->PR & EXTI_PR_PR2) {
         EXTI->PR = EXTI_PR_PR2; 
+        EXTI->IMR &= ~EXTI_IMR_MR2; // Tắt ngắt line 2 tạm thời
         
-        // BỘ LỌC CỨNG (Deep Filter): Chờ ~2ms
-        for (volatile int i = 0; i < 72000; i++); 
-        
-        if ((GPIOA->IDR & (1 << 2)) == 0) { 
-            static uint32_t last_interrupt_time = 0;
-            uint32_t current_time = xTaskGetTickCountFromISR();
-            
-            if (current_time - last_interrupt_time > 100) {
-                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-                uint8_t incoming_label = 0;
-                
-                if (xQueueReceiveFromISR(xQueue_A2, &incoming_label, &xHigherPriorityTaskWoken) == pdPASS) {
-                    if (incoming_label == 2) {
-                        GPIOB->BSRR = (1 << 14); 
-                        count_type2++;
-                        xTimerStartFromISR(xTimer_P2, &xHigherPriorityTaskWoken);
-                        xQueueSendFromISR(xQueue_Log, &incoming_label, &xHigherPriorityTaskWoken);
-                    } else if (incoming_label == 0) {
-                        count_type0++;
-                    }
-                }
-                last_interrupt_time = current_time;
-                portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-            }
-        }
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xTimerStartFromISR(xTimer_Debounce2, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
 }
 
@@ -226,22 +225,6 @@ void SystemClock_Config(void) {
     while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
 }
 
-// Task test hệ thống
-void Task_Blink(void *pvParameters) {
-    // Bật clock cho Port C (Giả sử LED test ở PC13)
-    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
-    
-    // Cấu hình PC13 là Output Push-Pull, tốc độ 2MHz
-    GPIOC->CRH &= ~(0xF << 20); // Clear bits 20-23
-    GPIOC->CRH |= (0x2 << 20);  // Output, 2MHz, Push-Pull
-
-    for(;;) {
-        GPIOC->ODR ^= (1 << 13); // Đảo trạng thái PC13
-        vTaskDelay(pdMS_TO_TICKS(500)); // Chờ 500ms một cách non-blocking
-    }
-}
-
-// Task Hợp nhất: Xử lý USB và Ghi Log an toàn
 void Task_USB_And_Logging(void *pvParameters) {
     tusb_init(); // Khởi tạo TinyUSB
     uint8_t log_label = 0;
@@ -296,30 +279,38 @@ void Task_LCD_Display(void *pvParameters) {
 
         // Máy trạng thái Render: Chỉ in dòng tiếp theo khi I2C và LCD đã rảnh
         if (render_step > 0 && hlcd.state == LCD_SM_IDLE) {
+            char num_buf[11]; // Buffer tạm để chứa số
+            
             switch (render_step) {
                 case 1:
                     lcd_setcursor(&hlcd, 0, 0);
-                    sprintf(buffer, "=== THONG KE ===");
+                    my_strcpy(buffer, "=== THONG KE ===");
                     lcd_print_string(&hlcd, buffer);
                     render_step = 2;
                     break;
                 case 2:
                     lcd_setcursor(&hlcd, 0, 1);
-                    sprintf(buffer, "Loai 1 (A1): %lu", count_type1);
+                    my_strcpy(buffer, "Loai 1 (A1): ");
+                    uint32_to_string(count_type1, num_buf);
+                    my_strcat(buffer, num_buf);
                     lcd_print_string(&hlcd, buffer);
                     render_step = 3;
                     break;
                 case 3:
                     lcd_setcursor(&hlcd, 0, 2);
-                    sprintf(buffer, "Loai 2 (A2): %lu", count_type2);
+                    my_strcpy(buffer, "Loai 2 (A2): ");
+                    uint32_to_string(count_type2, num_buf);
+                    my_strcat(buffer, num_buf);
                     lcd_print_string(&hlcd, buffer);
                     render_step = 4;
                     break;
                 case 4:
                     lcd_setcursor(&hlcd, 0, 3);
-                    sprintf(buffer, "Loai 0 (Bo): %lu", count_type0);
+                    my_strcpy(buffer, "Loai 0 (Bo): ");
+                    uint32_to_string(count_type0, num_buf);
+                    my_strcat(buffer, num_buf);
                     lcd_print_string(&hlcd, buffer);
-                    render_step = 0; // Hoàn thành quét 1 khung hình
+                    render_step = 0;
                     break;
             }
         }
@@ -330,6 +321,73 @@ void Task_LCD_Display(void *pvParameters) {
         // Nhường CPU 2ms (Tương đương chu kỳ quét màn hình 500Hz)
         vTaskDelay(pdMS_TO_TICKS(2)); 
     }
+}
+
+void vTimerCallback_Debounce0(TimerHandle_t xTimer) {
+    // Đã qua 2ms, kiểm tra lại xem chân PA0 có thực sự đang bị kéo xuống 0V không
+    if ((GPIOA->IDR & (1 << 0)) == 0) { 
+        static uint32_t last_trigger_time = 0;
+        uint32_t current_time = xTaskGetTickCount(); // Dùng API thường
+        
+        if (current_time - last_trigger_time > pdMS_TO_TICKS(100)) {
+            uint8_t mock_label = 2; 
+            xQueueSend(xQueue_A1, &mock_label, 0); // Dùng API thường, timeout = 0
+            last_trigger_time = current_time;
+        }
+    }
+    // Xóa cờ ngắt rác sinh ra trong 2ms vừa qua và BẬT LẠI ngắt EXTI0
+    EXTI->PR = EXTI_PR_PR0; 
+    EXTI->IMR |= EXTI_IMR_MR0; 
+}
+
+void vTimerCallback_Debounce1(TimerHandle_t xTimer) {
+    if ((GPIOA->IDR & (1 << 1)) == 0) { 
+        static uint32_t last_trigger_time = 0;
+        uint32_t current_time = xTaskGetTickCount();
+        
+        if (current_time - last_trigger_time > pdMS_TO_TICKS(100)) {
+            uint8_t incoming_label = 0;
+            
+            if (xQueueReceive(xQueue_A1, &incoming_label, 0) == pdPASS) { // Dùng API thường
+                if (incoming_label == 1) {
+                    GPIOB->BSRR = (1 << 13); 
+                    count_type1++;
+                    xTimerStart(xTimer_P1, 0); // Khởi động Timer Piston bằng API thường
+                    xQueueSend(xQueue_Log, &incoming_label, 0); 
+                } else {
+                    xQueueSend(xQueue_A2, &incoming_label, 0); 
+                }
+            }
+            last_trigger_time = current_time;
+        }
+    }
+    EXTI->PR = EXTI_PR_PR1; 
+    EXTI->IMR |= EXTI_IMR_MR1;
+}
+
+void vTimerCallback_Debounce2(TimerHandle_t xTimer) {
+    if ((GPIOA->IDR & (1 << 2)) == 0) { 
+        static uint32_t last_trigger_time = 0;
+        uint32_t current_time = xTaskGetTickCount();
+        
+        if (current_time - last_trigger_time > pdMS_TO_TICKS(100)) {
+            uint8_t incoming_label = 0;
+            
+            if (xQueueReceive(xQueue_A2, &incoming_label, 0) == pdPASS) { 
+                if (incoming_label == 2) {
+                    GPIOB->BSRR = (1 << 14); 
+                    count_type2++;
+                    xTimerStart(xTimer_P2, 0); 
+                    xQueueSend(xQueue_Log, &incoming_label, 0); 
+                } else if (incoming_label == 0) {
+                    count_type0++;
+                }
+            }
+            last_trigger_time = current_time;
+        }
+    }
+    EXTI->PR = EXTI_PR_PR2; 
+    EXTI->IMR |= EXTI_IMR_MR2;
 }
 
 int main(void) {
@@ -346,6 +404,10 @@ int main(void) {
     // 500 là thời gian Piston bật (ms), (void*)1 là ID để phân biệt Piston
     xTimer_P1 = xTimerCreate("Tim_P1", pdMS_TO_TICKS(500), pdFALSE, (void*)1, vTimerCallback_Piston);
     xTimer_P2 = xTimerCreate("Tim_P2", pdMS_TO_TICKS(500), pdFALSE, (void*)2, vTimerCallback_Piston);
+
+    xTimer_Debounce0 = xTimerCreate("Deb0", pdMS_TO_TICKS(2), pdFALSE, (void*)0, vTimerCallback_Debounce0);
+    xTimer_Debounce1 = xTimerCreate("Deb1", pdMS_TO_TICKS(2), pdFALSE, (void*)1, vTimerCallback_Debounce1);
+    xTimer_Debounce2 = xTimerCreate("Deb2", pdMS_TO_TICKS(2), pdFALSE, (void*)2, vTimerCallback_Debounce2);
 
     // 3. Tạo Tasks
     // Cấp phát 256 word (1KB RAM) là đủ cho cả USB và Log
