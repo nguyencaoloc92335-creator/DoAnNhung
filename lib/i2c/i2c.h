@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include <stm32f1xx.h>
+#include "FreeRTOS.h"      
+#include "semphr.h"
 
 // Định nghĩa các trạng thái trả về của I2C
 typedef enum {
@@ -34,6 +36,7 @@ typedef struct {
     volatile I2C_State_t state;       // Trạng thái hiện tại của quá trình giao
     uint32_t ClockSpeed;   // Tốc độ giao tiếp (ví dụ: 100000 cho 100kHz)
     volatile I2C_Status_t error;
+    SemaphoreHandle_t semaphore;
 } I2C_Handle_t;
 
 I2C_Status_t I2C_Init(I2C_Handle_t *hi2c);

@@ -91,14 +91,18 @@ LCD_Status_t lcd_print_string(I2C_LCD_HandleTypeDef *lcd, const char *str)
         return LCD_busy; 
     }
 
-    // 2. Nạp dữ liệu vào buffer cục bộ của LCD
-    strncpy(lcd->buffer, str, sizeof(lcd->buffer) - 1);
-    lcd->buffer[sizeof(lcd->buffer) - 1] = '\0'; // Đảm bảo luôn có ký tự kết thúc chuỗi
+    // 2. Nạp dữ liệu vào buffer cục bộ của LCD VÀ tính toán độ dài
+    uint8_t i = 0;
+    while (str[i] != '\0' && i < (sizeof(lcd->buffer) - 1)) {
+        lcd->buffer[i] = str[i];
+        i++;
+    }
+    lcd->buffer[i] = '\0'; // Đảm bảo luôn có ký tự kết thúc chuỗi
     
     // 3. Khởi tạo các thông số cho State Machine
-    lcd->buf_length = strlen(lcd->buffer);
+    lcd->buf_length = i; // Biến i lúc này chính là độ dài của chuỗi
     lcd->buf_index = 0;
-    lcd->current_rs = 1; // RS = 1 để I2C biết đây là Dữ liệu (Data), không phải Lệnh (Command)
+    lcd->current_rs = 1; 
     
     // 4. Kích hoạt State Machine
     lcd->state = LCD_SM_SENDING_HIGH; 

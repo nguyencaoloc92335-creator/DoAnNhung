@@ -68,6 +68,11 @@ I2C_Status_t I2C_Init(I2C_Handle_t *hi2c) {
     // Công thức này được ghi vào thanh ghi TRISE để I2C biết được thời gian tối đa cho phép để tín hiệu trên bus tăng lên từ mức thấp đến mức cao. Nếu không cấu hình đúng TRISE, I2C có thể không đáp ứng được yêu cầu về thời gian của các tín hiệu, dẫn đến lỗi giao tiếp.
 
     hi2c->Instance->CR1 |= I2C_CR1_PE; // Bật I2C bằng cách ghi bit PE trong thanh ghi CR1
+
+    if (hi2c->semaphore == NULL) {
+        hi2c->semaphore = xSemaphoreCreateBinary();
+    }
+
     return I2C_OK;
 }
 
@@ -102,6 +107,7 @@ I2C_Status_t I2C_Master_Transmit_IT(I2C_Handle_t *hi2c, uint16_t address, uint8_
 }
 
 void I2C1_EV_IRQHandler(void) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     uint32_t sr1 = hi2c1_global->Instance->SR1; // Đọc thanh ghi SR1 để xác định sự kiện nào đã xảy ra, điều này cũng sẽ xóa cờ ngắt tương ứng
     // Kiểm tra xem slave có gửi ACK không
     if (sr1 & I2C_SR1_AF)
@@ -110,9 +116,12 @@ void I2C1_EV_IRQHandler(void) {
         hi2c1_global->Instance->SR1 &= ~I2C_SR1_AF; // xóa cờ AF-cờ báo lỗi không nhận được ACK
         hi2c1_global->error = I2C_ERROR; // ghi vào là lỗi
         hi2c1_global->busy = 0; // Xóa cờ bận để báo rằng I2C đã sẵn sàng cho quá trình mới
+        xSemaphoreGiveFromISR(hi2c1_global->semaphore, &xHigherPriorityTaskWoken);
         hi2c1_global->Instance->CR2 &= ~I2C_CR2_ITEVTEN; // Tắt ngắt sự kiện I2C
         hi2c1_global->Instance->CR2 &= ~I2C_CR2_ITBUFEN; // Tắt ngắt buffer
         NVIC_DisableIRQ(I2C1_EV_IRQn);
+
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Ép RTOS chuyển ngữ cảnh ngay
         return;
     }
     
@@ -129,14 +138,19 @@ void I2C1_EV_IRQHandler(void) {
             hi2c1_global->Instance->CR1 |= I2C_CR1_STOP; // Gửi tín hiệu STOP khi đã gửi hết dữ liệu
             hi2c1_global->state = I2C_STATE_DONE; // Cập nhật trạng thái là đã hoàn thành
             hi2c1_global->busy = 0; // Xóa cờ bận để báo rằng I2C đã sẵn sàng cho quá trình mới
+            // Nhả Semaphore báo gửi xong
+            xSemaphoreGiveFromISR(hi2c1_global->semaphore, &xHigherPriorityTaskWoken);
             hi2c1_global->Instance->CR2 &= ~I2C_CR2_ITEVTEN; // Tắt ngắt sự kiện I2C
             hi2c1_global->Instance->CR2 &= ~I2C_CR2_ITBUFEN; // Tắt ngắt buffer
             NVIC_DisableIRQ(I2C1_EV_IRQn); // Tắt ngắt I2C1 event trong NVIC
+
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Ép RTOS chuyển ngữ cảnh
         }
     }
 }
 
 void I2C2_EV_IRQHandler(void) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     uint32_t sr1 = hi2c2_global->Instance->SR1; // Đọc thanh ghi SR1 để xác định sự kiện nào đã xảy ra, điều này cũng sẽ xóa cờ ngắt tương ứng
     // Kiểm tra xem slave có gửi ACK không
     if (sr1 & I2C_SR1_AF)
@@ -145,9 +159,14 @@ void I2C2_EV_IRQHandler(void) {
         hi2c2_global->Instance->SR1 &= ~I2C_SR1_AF; // xóa cờ AF-cờ báo lỗi không nhận được ACK
         hi2c2_global->error = I2C_ERROR; // ghi vào là lỗi
         hi2c2_global->busy = 0; // Xóa cờ bận để báo rằng I2C đã sẵn sàng cho quá trình mới
+        // Nhả Semaphore báo lỗi
+        xSemaphoreGiveFromISR(hi2c1_global->semaphore, &xHigherPriorityTaskWoken);
         hi2c2_global->Instance->CR2 &= ~I2C_CR2_ITEVTEN; // Tắt ngắt sự kiện I2C
         hi2c2_global->Instance->CR2 &= ~I2C_CR2_ITBUFEN; // Tắt ngắt buffer
         NVIC_DisableIRQ(I2C2_EV_IRQn);
+
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Ép RTOS chuyển ngữ cảnh ngay
+
         return;
     }
     
@@ -164,30 +183,30 @@ void I2C2_EV_IRQHandler(void) {
             hi2c2_global->Instance->CR1 |= I2C_CR1_STOP; // Gửi tín hiệu STOP khi đã gửi hết dữ liệu
             hi2c2_global->state = I2C_STATE_DONE; // Cập nhật trạng thái là đã hoàn thành
             hi2c2_global->busy = 0; // Xóa cờ bận để báo rằng I2C đã sẵn sàng cho quá trình mới
+            // Nhả Semaphore báo gửi xong
+            xSemaphoreGiveFromISR(hi2c1_global->semaphore, &xHigherPriorityTaskWoken);
             hi2c2_global->Instance->CR2 &= ~I2C_CR2_ITEVTEN; // Tắt ngắt sự kiện I2C
             hi2c2_global->Instance->CR2 &= ~I2C_CR2_ITBUFEN; // Tắt ngắt buffer
             NVIC_DisableIRQ(I2C2_EV_IRQn); // Tắt ngắt I2C2 event trong NVIC
 
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Ép RTOS chuyển ngữ cảnh
         }
     }
 }
 
 I2C_Status_t I2C_WaitUntilReady(I2C_Handle_t *hi2c) {
-    uint32_t timeout = 100000;
-    
-    // 1. Chờ biến phần mềm (ngắt sự kiện đẩy xong dữ liệu)
-    while (hi2c->busy) {
-        if (--timeout == 0) {
-            hi2c->busy = 0; // Tránh treo module nếu quá thời gian
-            return I2C_TIMEOUT;
+    // 1. Chờ Semaphore từ ngắt trả về (Task sẽ ngủ, CPU rảnh 100%)
+    // pdMS_TO_TICKS(100) là timeout 100ms để chống treo vĩnh viễn
+    if (xSemaphoreTake(hi2c->semaphore, pdMS_TO_TICKS(100)) == pdTRUE) {
+        
+        // 2. Chờ phần cứng I2C THỰC SỰ nhả Bus (Quét cờ BUSY của thanh ghi SR2)
+        uint32_t hw_timeout = 100000;
+        while ((hi2c->Instance->SR2 & I2C_SR2_BUSY) != 0) {
+            if (--hw_timeout == 0) return I2C_TIMEOUT;
         }
+        return hi2c->error;
+    } else {
+        hi2c->busy = 0; // Tránh treo module nếu quá thời gian
+        return I2C_TIMEOUT;
     }
-    
-    // 2. Chờ phần cứng I2C THỰC SỰ nhả Bus (Quét cờ BUSY của thanh ghi SR2)
-    timeout = 100000;
-    while ((hi2c->Instance->SR2 & I2C_SR2_BUSY) != 0) {
-        if (--timeout == 0) return I2C_TIMEOUT;
-    }
-    
-    return hi2c->error;
 }
