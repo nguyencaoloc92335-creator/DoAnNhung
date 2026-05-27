@@ -3,7 +3,6 @@
 #include "task.h"
 #include "queue.h"
 #include "timers.h"
-#include "tusb.h"
 #include "i2c.h"
 #include "lcd_i2c.h"
 
@@ -50,6 +49,45 @@ void Check_Limit(void) {
             GPIOB->BRR = (1 << 12); // Tắt chân PB12 để dừng băng tải ngay lập tức
             system_halted = 1;
         }
+    }
+}
+
+// --- CÁC HÀM GIAO TIẾP UART ---
+
+// 1. Hàm gửi 1 ký tự
+void UART1_SendChar(char c) {
+    // Chờ cờ TXE (Transmit Data Register Empty - Bit 7) bật lên báo hiệu thanh ghi trống
+    while (!(USART1->SR & USART_SR_TXE)); 
+    USART1->DR = c; // Đẩy ký tự vào thanh ghi truyền
+}
+
+// 2. Hàm gửi 1 chuỗi ký tự
+void UART1_SendString(const char *str) {
+    while (*str != '\0') {
+        UART1_SendChar(*str);
+        str++;
+    }
+}
+
+// 3. Hàm in số nguyên dương
+void UART1_SendNumber(uint32_t num) {
+    char buf[11]; // Đủ chứa số tối đa 4 tỷ (10 chữ số) + null
+    int i = 0;
+    
+    if (num == 0) {
+        UART1_SendChar('0');
+        return;
+    }
+    
+    // Tách từng chữ số (bị ngược)
+    while (num > 0) {
+        buf[i++] = (num % 10) + '0';
+        num /= 10;
+    }
+    
+    // In ngược mảng lại để ra số đúng
+    for (int j = i - 1; j >= 0; j--) {
+        UART1_SendChar(buf[j]);
     }
 }
 
@@ -114,19 +152,29 @@ void delay_ms(uint32_t ms) {
 }
 
 void Hardware_Init(void) {
-    // 1. Bật Clock cho PORTA, PORTB và AFIO (Cực kỳ quan trọng cho ngắt)
+    // --- 1. BẬT XUNG NHỊP CHO GPIOA VÀ USART1 ---
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_USART1EN;
+
+    // --- 2. CẤU HÌNH CHÂN PA9 (TX) VÀ PA10 (RX) ---
+    // Xóa cấu hình cũ của PA9 (bit 4-7) và PA10 (bit 8-11) trong thanh ghi CRH
+    GPIOA->CRH &= ~(GPIO_CRH_CNF9 | GPIO_CRH_MODE9 | GPIO_CRH_CNF10 | GPIO_CRH_MODE10);
+    
+    // Thiết lập PA9 (TX): Alternate function Push-pull, tốc độ max 50MHz (0xB)
+    // Thiết lập PA10 (RX): Floating input (0x4)
+    GPIOA->CRH |= (0xB << 4) | (0x4 << 8);
+
+    // --- 3. CẤU HÌNH TỐC ĐỘ BAUD 115200 ---
+    // Giả sử vi điều khiển của bạn đang chạy ở xung nhịp tối đa 72MHz
+    USART1->BRR = 72000000 / 115200; 
+
+    // --- 4. BẬT USART1 ---
+    // Kích hoạt USART (UE), Kích hoạt bộ phát (TE) và bộ thu (RE)
+    USART1->CR1 |= USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+
+    // 1. Bật Clock 
     RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_AFIOEN;
-    RCC->APB1ENR |= RCC_APB1ENR_USBEN;
 
     NVIC_SetPriorityGrouping(3);
-
-    // --- ÉP PC NHẬN LẠI USB (FORCE RE-ENUMERATE) ---
-    // Cấu hình chân DP (PA12) là Output Push-Pull để kéo xuống GND
-    GPIOA->CRH &= ~(0x000F0000); // Clear bits của PA12
-    GPIOA->CRH |= 0x00020000;    // Output 2MHz
-    GPIOA->BRR = (1 << 12);      // Kéo PA12 xuống LOW
-    for(volatile int i = 0; i < 720000; i++); // Trễ cứng ~10ms để PC ngắt kết nối cũ
-    // TinyUSB sau đó sẽ tự động lấy lại cấu hình PA12 thành Alternate Function.
 
     // --- CẤU HÌNH CẢM BIẾN (PA0-PA2) & NÚT BẤM (PA3-PA6) ---
     // Clear cấu hình cũ của chân PA0 đến PA7 (bits 0-31 của CRL)
@@ -162,15 +210,11 @@ void Hardware_Init(void) {
     NVIC_SetPriority(EXTI1_IRQn, 6);
     NVIC_SetPriority(EXTI2_IRQn, 6);
 
-    // BẮT BUỘC: Cấu hình ưu tiên ngắt cho USB (Priority phải >= 5)
-    NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 6);
     NVIC_SetPriority(I2C1_EV_IRQn, 6);
 
     NVIC_EnableIRQ(EXTI0_IRQn);
     NVIC_EnableIRQ(EXTI1_IRQn);
-    NVIC_EnableIRQ(EXTI2_IRQn);
-    NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
-    
+    NVIC_EnableIRQ(EXTI2_IRQn); 
 }
 
 // Ngắt Cảm biến A0
@@ -209,7 +253,6 @@ void EXTI2_IRQHandler(void) {
     }
 }
 
-// Hàm này sẽ dùng chung cho cả 2 Piston
 void vTimerCallback_Piston(TimerHandle_t xTimer) {
     // Lấy ID của Timer để biết Piston nào vừa hết giờ
     uint32_t timer_id = (uint32_t) pvTimerGetTimerID(xTimer);
@@ -243,32 +286,29 @@ void SystemClock_Config(void) {
     while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
 }
 
-void Task_USB_And_Logging(void *pvParameters) {
-    tusb_init(); // Khởi tạo TinyUSB
+void Task_UART_Logging(void *pvParameters) {
     uint8_t log_label = 0;
-    char log_buffer[] = "LOG,0\r\n";
+    
+    // In câu chào khi hệ thống vừa khởi động xong
+    UART1_SendString("\r\n=== HE THONG BANG TAI DA KHOI DONG ===\r\n");
     
     for(;;) {
-        tud_task(); // Luôn chạy để duy trì sự sống cho USB
-        
-        // Đọc Queue KHÔNG CHẶN (tham số 0) để không làm kẹt tud_task
-        if (xQueueReceive(xQueue_Log, &log_label, 0) == pdPASS) {
-            if (tud_cdc_connected()) {
-                log_buffer[4] = log_label + '0';
-                tud_cdc_write(log_buffer, 7);
-                tud_cdc_write_flush();
-            }
+        // Task sẽ tự động Block (ngủ) ở đây chờ đến khi ngắt nhét dữ liệu vào Queue
+        if (xQueueReceive(xQueue_Log, &log_label, portMAX_DELAY) == pdPASS) {
+            UART1_SendString("=> Phat hien vat the loai: ");
+            UART1_SendNumber(log_label);
+            UART1_SendString("\r\n");
+            
+            // Bạn có thể in thêm thống kê tổng số lượng nếu thích
+            UART1_SendString("   Tong so luong hien tai: L0=");
+            UART1_SendNumber(count_type0);
+            UART1_SendString(", L1=");
+            UART1_SendNumber(count_type1);
+            UART1_SendString(", L2=");
+            UART1_SendNumber(count_type2);
+            UART1_SendString("\r\n-----------------------\r\n");
         }
-        vTaskDelay(pdMS_TO_TICKS(1)); // Nhường 1ms CPU cho các Task khác
     }
-}
-
-// --- HÀM NGẮT BẮT BUỘC CHO TINYUSB ---
-void USB_LP_CAN1_RX0_IRQHandler(void) {
-    tud_int_handler(0);
-}
-void USBWakeUp_IRQHandler(void) {
-    tud_int_handler(0);
 }
 
 void Task_LCD_Display(void *pvParameters) {
@@ -502,8 +542,7 @@ int main(void) {
     xTimer_Debounce2 = xTimerCreate("Deb2", pdMS_TO_TICKS(2), pdFALSE, (void*)2, vTimerCallback_Debounce2);
 
     // 3. Tạo Tasks
-    // Cấp phát 256 word (1KB RAM) là đủ cho cả USB và Log
-    xTaskCreate(Task_USB_And_Logging, "USB_LOG", 256, NULL, configMAX_PRIORITIES - 1, NULL);
+    xTaskCreate(Task_UART_Logging, "UART_LOG", 256, NULL, configMAX_PRIORITIES - 1, NULL);
     xTaskCreate(Task_LCD_Display, "LCD_DISP", 256, NULL, tskIDLE_PRIORITY + 2, NULL);
 
     // Khởi động hệ điều hành
