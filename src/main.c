@@ -41,6 +41,17 @@ volatile uint32_t limit_type0 = 5;     // Ngưỡng dừng riêng cho Loại 0
 volatile uint32_t limit_type1 = 5;     // Ngưỡng dừng riêng cho Loại 1
 volatile uint32_t limit_type2 = 5;     // Ngưỡng dừng riêng cho Loại 2
 volatile uint8_t system_halted = 0;    // 0: Băng tải đang chạy, 1: Đã dừng do đủ hàng
+volatile uint8_t pc_disconnected = 0; // 0: PC đang kết nối, 1: Mất PC
+
+typedef struct {
+    uint32_t id;
+    uint8_t type;
+} ConveyorItem_t;
+
+volatile uint32_t global_item_id = 0;
+
+// Thêm Timer Watchdog
+TimerHandle_t xTimer_PC_Watchdog;
 
 // Hàm kiểm tra ngưỡng riêng biệt - Chỉ cần 1 loại đạt ngưỡng là dừng toàn hệ thống
 void Check_Limit(void) {
@@ -204,6 +215,9 @@ void Hardware_Init(void) {
     // Chọn kích hoạt sườn xuống (Vật thể đi qua làm tín hiệu kéo xuống 0V)
     EXTI->FTSR |= (EXTI_FTSR_TR0 | EXTI_FTSR_TR1 | EXTI_FTSR_TR2);
 
+    // --- BẬT NGẮT NHẬN DỮ LIỆU TỪ PC ---
+    USART1->CR1 |= USART_CR1_RXNEIE;  // Bật cờ ngắt khi có byte RX bay tới
+
     // --- CẤU HÌNH NVIC CHO FREERTOS ---
     // BẮT BUỘC: Mức ưu tiên ngắt phải thấp hơn (số lớn hơn) configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (đang là 5)
     NVIC_SetPriority(EXTI0_IRQn, 6);
@@ -214,7 +228,10 @@ void Hardware_Init(void) {
 
     NVIC_EnableIRQ(EXTI0_IRQn);
     NVIC_EnableIRQ(EXTI1_IRQn);
-    NVIC_EnableIRQ(EXTI2_IRQn); 
+    NVIC_EnableIRQ(EXTI2_IRQn);
+    
+    NVIC_SetPriority(USART1_IRQn, 6); 
+    NVIC_EnableIRQ(USART1_IRQn);      // Cho phép ngắt USART1 hoạt động
 }
 
 // Ngắt Cảm biến A0
@@ -287,20 +304,28 @@ void SystemClock_Config(void) {
 }
 
 void Task_UART_Logging(void *pvParameters) {
-    uint8_t log_label = 0;
+    ConveyorItem_t log_item; // Hứng cả ID và Type
     
-    // In câu chào khi hệ thống vừa khởi động xong
     UART1_SendString("\r\n=== HE THONG BANG TAI DA KHOI DONG ===\r\n");
     
     for(;;) {
-        // Task sẽ tự động Block (ngủ) ở đây chờ đến khi ngắt nhét dữ liệu vào Queue
-        if (xQueueReceive(xQueue_Log, &log_label, portMAX_DELAY) == pdPASS) {
-            UART1_SendString("=> Phat hien vat the loai: ");
-            UART1_SendNumber(log_label);
-            UART1_SendString("\r\n");
+        if (xQueueReceive(xQueue_Log, &log_item, portMAX_DELAY) == pdPASS) {
             
-            // Bạn có thể in thêm thống kê tổng số lượng nếu thích
-            UART1_SendString("   Tong so luong hien tai: L0=");
+            // 1. BÁO CÁO DONE VỀ CHO PYTHON
+            UART1_SendString("DONE:");
+            UART1_SendNumber(log_item.id);
+            UART1_SendString(",");
+            UART1_SendNumber(log_item.type);
+            UART1_SendString("\n");
+
+            // 2. IN LOG HIỂN THỊ LÊN MÀN HÌNH TERMINAL (Tuỳ chọn xem cho dễ)
+            UART1_SendString("=> Da xu ly xong vat the ID: ");
+            UART1_SendNumber(log_item.id);
+            UART1_SendString(" (Loai ");
+            UART1_SendNumber(log_item.type);
+            UART1_SendString(")\r\n");
+            
+            UART1_SendString("   Tong so luong: L0=");
             UART1_SendNumber(count_type0);
             UART1_SendString(", L1=");
             UART1_SendNumber(count_type1);
@@ -319,8 +344,8 @@ void Task_LCD_Display(void *pvParameters) {
 
     hlcd.hi2c = &hi2c1;
     hlcd.address = 0x27; 
-    hlcd.col = 16;       // Chỉnh thành 16 cột
-    hlcd.row = 2;        // Chỉnh thành 2 hàng
+    hlcd.col = 16;       
+    hlcd.row = 2;        
     lcd_init(&hlcd);
 
     TickType_t last_update = 0;
@@ -396,130 +421,287 @@ void Task_LCD_Display(void *pvParameters) {
         }
 
         // --- 3. RENDER CHO MÀN HÌNH 1602 (Tối đa 16 ký tự/dòng) ---
+        // Theo dõi sự thay đổi của cờ pc_disconnected để ép render ngay
+        static uint8_t last_pc_state = 0;
+        if (pc_disconnected != last_pc_state) {
+            force_render = 1;
+            last_pc_state = pc_disconnected;
+        }
         if (force_render && hlcd.state == LCD_SM_IDLE) {
             if (render_step == 0) render_step = 1;
-            char num_buf[11];
             
             switch (render_step) {
                 case 1:
-                    // VẼ HÀNG 1 (Tiêu đề trang)
                     lcd_setcursor(&hlcd, 0, 0);
-                    if (in_setting_mode) {
+                    
+                    // --- ƯU TIÊN 1: HIỂN THỊ LỖI PC ---
+                    if (pc_disconnected == 1) {
+                        my_strcpy(buffer, "LOI KET NOI PC! ");
+                    } 
+                    // --- ƯU TIÊN 2: CÀI ĐẶT NGƯỠNG ---
+                    else if (in_setting_mode) {
                         my_strcpy(buffer, "CAI NGUONG L");
-                    } else {
+                        char p[2] = {current_page + '0', '\0'};
+                        my_strcat(buffer, p);
+                    } 
+                    // --- ƯU TIÊN 3: CHẾ ĐỘ CHẠY BÌNH THƯỜNG ---
+                    else {
                         my_strcpy(buffer, "LOAI ");
+                        char p[2] = {current_page + '0', '\0'};
+                        my_strcat(buffer, p);
+                        if (system_halted) my_strcat(buffer, " [DUNG]");
                     }
                     
-                    char p[2] = {current_page + '0', '\0'};
-                    my_strcat(buffer, p);
-
-                    // Thêm thông báo nếu hệ thống DỪNG ở trang hiển thị
-                    if (!in_setting_mode && system_halted) {
-                        my_strcat(buffer, " [DUNG]");
-                    }
-                    
-                    while (my_strlen(buffer) < 16) my_strcat(buffer, " "); // Pad đúng 16 dấu cách
+                    while (my_strlen(buffer) < 16) my_strcat(buffer, " "); 
                     lcd_print_string(&hlcd, buffer);
                     render_step = 2;
                     break;
 
                 case 2:
-                    // VẼ HÀNG 2 (Dữ liệu)
                     lcd_setcursor(&hlcd, 0, 1);
-                    if (in_setting_mode) {
-                        my_strcpy(buffer, "Limit: ");
-                        uint32_t cur_limit = (current_page == 0) ? limit_type0 : ((current_page == 1) ? limit_type1 : limit_type2);
-                        uint32_to_string(cur_limit, num_buf);
-                        my_strcat(buffer, num_buf);
-                    } else {
-                        my_strcpy(buffer, "So luong: ");
-                        uint32_t cur_count = (current_page == 0) ? count_type0 : ((current_page == 1) ? count_type1 : count_type2);
-                        uint32_to_string(cur_count, num_buf);
+                    
+                    // --- ƯU TIÊN 1: LỖI PC ---
+                    if (pc_disconnected == 1) {
+                        my_strcpy(buffer, "Bang tai ngat...");
+                    } 
+                    // --- ƯU TIÊN 2 & 3: HIỂN THỊ SỐ ---
+                    else {
+                        if (in_setting_mode) my_strcpy(buffer, "Limit: ");
+                        else my_strcpy(buffer, "So luong: ");
+                        
+                        char num_buf[11];
+                        uint32_t cur_val = 0;
+                        if (current_page == 0) cur_val = (in_setting_mode) ? limit_type0 : count_type0;
+                        else if (current_page == 1) cur_val = (in_setting_mode) ? limit_type1 : count_type1;
+                        else if (current_page == 2) cur_val = (in_setting_mode) ? limit_type2 : count_type2;
+                        
+                        uint32_to_string(cur_val, num_buf);
                         my_strcat(buffer, num_buf);
                     }
                     
-                    while (my_strlen(buffer) < 16) my_strcat(buffer, " "); // Pad đúng 16 dấu cách
+                    while (my_strlen(buffer) < 16) my_strcat(buffer, " "); 
                     lcd_print_string(&hlcd, buffer);
                     
-                    render_step = 0;     // Hoàn thành
+                    render_step = 0;     
                     force_render = 0;
                     break;
             }
         }
-
         lcd_task(&hlcd);
         vTaskDelay(pdMS_TO_TICKS(10)); // Nhường CPU
     }
 }
 
+// ========================================================
+// HÀM DEBOUNCE A0: TẠO ID MỚI & CHỐNG NHIỄU BÓNG MỜ
+// ========================================================
 void vTimerCallback_Debounce0(TimerHandle_t xTimer) {
-    // Đã qua 2ms, kiểm tra lại xem chân PA0 có thực sự đang bị kéo xuống 0V không
-    if ((GPIOA->IDR & (1 << 0)) == 0) { 
-        static uint32_t last_trigger_time = 0;
-        uint32_t current_time = xTaskGetTickCount(); // Dùng API thường
-        
-        if (current_time - last_trigger_time > pdMS_TO_TICKS(100)) {
-            uint8_t mock_label = 1; 
-            xQueueSend(xQueue_A1, &mock_label, 0); // Dùng API thường, timeout = 0
-            last_trigger_time = current_time;
+    static uint8_t is_locked = 0;       // 0: Đang rảnh đón vật mới, 1: Đang chờ vật cũ qua hết
+    static uint8_t continuous_high = 0; // Đếm số lần cảm biến trống
+
+    if (is_locked == 0) {
+        if ((GPIOA->IDR & (1 << 0)) == 0) { // Có vật thật
+            global_item_id++;
+            UART1_SendString("A0:");
+            UART1_SendNumber(global_item_id);
+            UART1_SendString("\n");
+            
+            is_locked = 1;       // Khóa, không nhận thêm ID
+            continuous_high = 0; 
+        } else {
+            // Nhiễu chớp nhoáng xẹt qua, bỏ qua và bật lại ngắt
+            EXTI->PR = EXTI_PR_PR0; 
+            EXTI->IMR |= EXTI_IMR_MR0;
+            return;
         }
     }
-    // Xóa cờ ngắt rác sinh ra trong 2ms vừa qua và BẬT LẠI ngắt EXTI0
-    EXTI->PR = EXTI_PR_PR0; 
-    EXTI->IMR |= EXTI_IMR_MR0; 
+    
+    // Nếu đang bị khóa (vật đang ở trên cảm biến)
+    if (is_locked == 1) {
+        if ((GPIOA->IDR & (1 << 0)) != 0) { // Cảm biến báo không thấy vật
+            continuous_high++;
+            if (continuous_high >= 3) { // Phải trống liên tục 3 lần (60ms) mới tin là qua hết
+                is_locked = 0;
+                continuous_high = 0;
+                
+                // Mở khóa: Bật lại ngắt EXTI để đón vật mới
+                EXTI->PR = EXTI_PR_PR0; 
+                EXTI->IMR |= EXTI_IMR_MR0; 
+                return; // Kết thúc quét
+            }
+        } else {
+            continuous_high = 0; // Cảm biến lại thấy vật -> Reset biến đếm trống
+        }
+        
+        // Vật chưa qua hết, tự động gọi lại Timer này sau 20ms để quét tiếp
+        xTimerStart(xTimer_Debounce0, 0); 
+    }
 }
 
+// ========================================================
+// HÀM DEBOUNCE A1: CHỐNG KÍCH PISTON ĐÚP & TRỘM QUEUE
+// ========================================================
 void vTimerCallback_Debounce1(TimerHandle_t xTimer) {
-    if ((GPIOA->IDR & (1 << 1)) == 0) { 
-        static uint32_t last_trigger_time = 0;
-        uint32_t current_time = xTaskGetTickCount();
-        
-        if (current_time - last_trigger_time > pdMS_TO_TICKS(100)) {
-            uint8_t incoming_label = 0;
-            
-            if (xQueueReceive(xQueue_A1, &incoming_label, 0) == pdPASS) { // Dùng API thường
-                if (incoming_label == 1) {
+    static uint8_t is_locked = 0;
+    static uint8_t continuous_high = 0;
+
+    if (is_locked == 0) {
+        if ((GPIOA->IDR & (1 << 1)) == 0) { 
+            ConveyorItem_t current_item;
+            if (xQueueReceive(xQueue_A1, &current_item, 0) == pdPASS) { 
+                if (current_item.type == 1) {
                     GPIOB->BSRR = (1 << 13); 
                     count_type1++;
                     Check_Limit();
-                    xTimerStart(xTimer_P1, 0); // Khởi động Timer Piston bằng API thường
-                    xQueueSend(xQueue_Log, &incoming_label, 0); 
+                    xTimerStart(xTimer_P1, 0); 
+                    xQueueSend(xQueue_Log, &current_item, 0); 
                 } else {
-                    xQueueSend(xQueue_A2, &incoming_label, 0); 
+                    xQueueSend(xQueue_A2, &current_item, 0); 
                 }
             }
-            last_trigger_time = current_time;
+            is_locked = 1;
+            continuous_high = 0;
+        } else {
+            EXTI->PR = EXTI_PR_PR1; 
+            EXTI->IMR |= EXTI_IMR_MR1;
+            return;
         }
     }
-    EXTI->PR = EXTI_PR_PR1; 
-    EXTI->IMR |= EXTI_IMR_MR1;
+    
+    if (is_locked == 1) {
+        if ((GPIOA->IDR & (1 << 1)) != 0) {
+            continuous_high++;
+            if (continuous_high >= 3) { 
+                is_locked = 0;
+                continuous_high = 0;
+                EXTI->PR = EXTI_PR_PR1; 
+                EXTI->IMR |= EXTI_IMR_MR1;
+                return;
+            }
+        } else {
+            continuous_high = 0;
+        }
+        xTimerStart(xTimer_Debounce1, 0);
+    }
 }
 
+// ========================================================
+// HÀM DEBOUNCE A2: CHỐNG KÍCH PISTON ĐÚP & TRỘM QUEUE
+// ========================================================
 void vTimerCallback_Debounce2(TimerHandle_t xTimer) {
-    if ((GPIOA->IDR & (1 << 2)) == 0) { 
-        static uint32_t last_trigger_time = 0;
-        uint32_t current_time = xTaskGetTickCount();
-        
-        if (current_time - last_trigger_time > pdMS_TO_TICKS(100)) {
-            uint8_t incoming_label = 0;
-            
-            if (xQueueReceive(xQueue_A2, &incoming_label, 0) == pdPASS) { 
-                if (incoming_label == 2) {
+    static uint8_t is_locked = 0;
+    static uint8_t continuous_high = 0;
+
+    if (is_locked == 0) {
+        if ((GPIOA->IDR & (1 << 2)) == 0) { 
+            ConveyorItem_t current_item;
+            if (xQueueReceive(xQueue_A2, &current_item, 0) == pdPASS) { 
+                if (current_item.type == 2) {
                     GPIOB->BSRR = (1 << 14); 
                     count_type2++;
                     Check_Limit();
                     xTimerStart(xTimer_P2, 0); 
-                    xQueueSend(xQueue_Log, &incoming_label, 0); 
-                } else if (incoming_label == 0) {
+                    xQueueSend(xQueue_Log, &current_item, 0); 
+                } else if (current_item.type == 0) {
                     count_type0++;
                     Check_Limit();
+                    xQueueSend(xQueue_Log, &current_item, 0); 
                 }
             }
-            last_trigger_time = current_time;
+            is_locked = 1;
+            continuous_high = 0;
+        } else {
+            EXTI->PR = EXTI_PR_PR2; 
+            EXTI->IMR |= EXTI_IMR_MR2;
+            return;
         }
     }
-    EXTI->PR = EXTI_PR_PR2; 
-    EXTI->IMR |= EXTI_IMR_MR2;
+    
+    if (is_locked == 1) {
+        if ((GPIOA->IDR & (1 << 2)) != 0) {
+            continuous_high++;
+            if (continuous_high >= 3) { 
+                is_locked = 0;
+                continuous_high = 0;
+                EXTI->PR = EXTI_PR_PR2; 
+                EXTI->IMR |= EXTI_IMR_MR2;
+                return;
+            }
+        } else {
+            continuous_high = 0;
+        }
+        xTimerStart(xTimer_Debounce2, 0);
+    }
+}
+
+// Nếu hàm này bị gọi, nghĩa là đã 1.5s trôi qua không nhận được PING từ Python
+void vTimerCallback_Watchdog(TimerHandle_t xTimer) {
+    if (pc_disconnected == 0) {
+        pc_disconnected = 1;      // Bật cờ lỗi PC
+        system_halted = 1;        // Khóa hệ thống
+        GPIOB->BRR = (1 << 12);   // Tắt ngay băng tải
+    }
+}
+
+volatile char rx_buf[25];
+volatile uint8_t rx_idx = 0;
+
+void USART1_IRQHandler(void) {
+    if (USART1->SR & USART_SR_RXNE) {
+        char c = USART1->DR;
+        
+        if (c == '\n' || c == '\r') {
+            rx_buf[rx_idx] = '\0'; 
+            
+            if (rx_idx > 0) {
+                // 1. Xử lý HEARTBEAT PING
+                // Xử lý HEARTBEAT PING (bên trong USART1_IRQHandler)
+                if (rx_buf[0]=='P' && rx_buf[1]=='I' && rx_buf[2]=='N' && rx_buf[3]=='G') {
+                    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                    xTimerResetFromISR(xTimer_PC_Watchdog, &xHigherPriorityTaskWoken);
+                    
+                    // Nếu trước đó đang mất kết nối, giờ có lại
+                    if (pc_disconnected == 1) {
+                        pc_disconnected = 0; // Xóa cờ lỗi
+                        
+                        // Kiểm tra xem số lượng đã đầy chưa, nếu chưa đầy thì chạy tiếp
+                        if (count_type0 < limit_type0 && count_type1 < limit_type1 && count_type2 < limit_type2) {
+                            system_halted = 0;
+                            GPIOB->BSRR = (1 << 12); // Bật lại băng tải
+                        }
+                    }
+                    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+                }
+                // 2. Xử lý DỮ LIỆU AI TRẢ VỀ: "AI:id,type"
+                else if (rx_buf[0]=='A' && rx_buf[1]=='I' && rx_buf[2]==':') {
+                    uint32_t p_id = 0;
+                    uint8_t p_type = 0;
+                    uint8_t i = 3;
+                    
+                    while(rx_buf[i] != ',' && rx_buf[i] != '\0') {
+                        p_id = p_id * 10 + (rx_buf[i] - '0');
+                        i++;
+                    }
+                    
+                    if (rx_buf[i] == ',') {
+                        p_type = rx_buf[i+1] - '0';
+                        
+                        ConveyorItem_t newItem = {p_id, p_type};
+                        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                        // Nhét vật thể vào hàng đợi A1
+                        xQueueSendFromISR(xQueue_A1, &newItem, &xHigherPriorityTaskWoken);
+                        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+                    }
+                }
+            }
+            rx_idx = 0; // Reset buffer cho chuỗi mới
+        } 
+        else {
+            // Chống tràn buffer nếu bị nhiễu dây UART
+            if (rx_idx < 24) rx_buf[rx_idx++] = c;
+            else rx_idx = 0; 
+        }
+    }
 }
 
 int main(void) {
@@ -528,18 +710,21 @@ int main(void) {
     Hardware_Init(); // Hàm Init chân GPIO/EXTI ở Bước 2
 
     // 1. Tạo Queues
-    xQueue_A1 = xQueueCreate(10, sizeof(uint8_t));
-    xQueue_A2 = xQueueCreate(10, sizeof(uint8_t));
-    xQueue_Log = xQueueCreate(10, sizeof(uint8_t));
+    xQueue_A1 = xQueueCreate(10, sizeof(ConveyorItem_t));
+    xQueue_A2 = xQueueCreate(10, sizeof(ConveyorItem_t));
+    xQueue_Log = xQueueCreate(10, sizeof(ConveyorItem_t));
 
     // 2. Tạo Software Timers (Chế độ pdFALSE = One-shot, chạy 1 lần rồi tắt)
     // 500 là thời gian Piston bật (ms), (void*)1 là ID để phân biệt Piston
     xTimer_P1 = xTimerCreate("Tim_P1", pdMS_TO_TICKS(500), pdFALSE, (void*)1, vTimerCallback_Piston);
     xTimer_P2 = xTimerCreate("Tim_P2", pdMS_TO_TICKS(500), pdFALSE, (void*)2, vTimerCallback_Piston);
 
-    xTimer_Debounce0 = xTimerCreate("Deb0", pdMS_TO_TICKS(2), pdFALSE, (void*)0, vTimerCallback_Debounce0);
-    xTimer_Debounce1 = xTimerCreate("Deb1", pdMS_TO_TICKS(2), pdFALSE, (void*)1, vTimerCallback_Debounce1);
-    xTimer_Debounce2 = xTimerCreate("Deb2", pdMS_TO_TICKS(2), pdFALSE, (void*)2, vTimerCallback_Debounce2);
+    xTimer_Debounce0 = xTimerCreate("Deb0", pdMS_TO_TICKS(20), pdFALSE, (void*)0, vTimerCallback_Debounce0);
+    xTimer_Debounce1 = xTimerCreate("Deb1", pdMS_TO_TICKS(20), pdFALSE, (void*)1, vTimerCallback_Debounce1);
+    xTimer_Debounce2 = xTimerCreate("Deb2", pdMS_TO_TICKS(20), pdFALSE, (void*)2, vTimerCallback_Debounce2);    
+
+    xTimer_PC_Watchdog = xTimerCreate("WDG", pdMS_TO_TICKS(1500), pdFALSE, 0, vTimerCallback_Watchdog);
+    xTimerStart(xTimer_PC_Watchdog, 0);
 
     // 3. Tạo Tasks
     xTaskCreate(Task_UART_Logging, "UART_LOG", 256, NULL, configMAX_PRIORITIES - 1, NULL);
