@@ -26,7 +26,7 @@ CLASS_MAPPING = {
     2: (0, "Hong (0)")     # YOLO ID 2 (damaged) -> STM32 ID 0
 }
 
-print("[*] Dang load model YOLOv8 (Vui long doi)...")
+print("[*] Dang load model (Vui long doi)...")
 model = YOLO('phanloaicachua_cocanbangdulieu_final.pt') 
 print("[*] Load model thanh cong!")
 
